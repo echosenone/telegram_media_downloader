@@ -17,3 +17,9 @@ file_formats:
   - all
   video:
   - all
+
+#optional
+download_directory: null  # Custom directory path for downloads (absolute or relative)
+start_date: null
+end_date: null
+max_messages: null

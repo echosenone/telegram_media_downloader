@@ -25,30 +25,74 @@ A meta of last read/downloaded message is stored in the config file so that in s
 ### Support:
 | Category | Support |
 |--|--|
-|Language | `Python 3.7 ` and above|
+|Language | `Python 3.8 ` and above|
 |Download media types|  audio, document, photo, video, video_note, voice|
 
 ### ToDo:
 - Add support for multiple channels/chats.
 
+## ⚠️ Version 3.0.0 - Breaking Changes
+
+**This version (3.0.0) contains breaking changes** due to migration from **Pyrogram** to **Telethon**.
+
+### What's Changed:
+- **Backend Migration**: Complete migration from Pyrogram to Telethon library
+- **API Changes**: Some configuration options may have changed
+- **Dependencies**: Updated to use Telethon-specific dependencies
+- **Python Requirement**: Now requires Python 3.8 or higher (previously 3.7+)
+
+### Migration Guide:
+If you're upgrading from a previous version:
+1. **Backup your `config.yaml`** and downloaded media
+2. **Use `make install`** to ensure all dependencies are properly installed
+3. **Review your configuration** as some options may have changed
+4. **Test with a small channel first** to verify everything works
+
 ### Installation
 
-For *nix os distributions with `make` availability
+> **⚠️ Important**: For version 3.0.0, we strongly recommend using `make install` to ensure all dependencies are properly installed with correct Python version compatibility.
+
+#### For *nix OS distributions with `make` availability (Recommended):
 ```sh
-$ git clone https://github.com/Dineshkarthik/telegram_media_downloader.git
-$ cd telegram_media_downloader
-$ make install
+git clone https://github.com/Dineshkarthik/telegram_media_downloader.git
+cd telegram_media_downloader
+make install
 ```
-For Windows which doesn't have `make` inbuilt
+
+#### For Windows or systems without `make`:
 ```sh
-$ git clone https://github.com/Dineshkarthik/telegram_media_downloader.git
-$ cd telegram_media_downloader
-$ pip3 install -r requirements.txt
+git clone https://github.com/Dineshkarthik/telegram_media_downloader.git
+cd telegram_media_downloader
+pip3 install -r requirements.txt
 ```
+
+> **Note**: The `make install` command automatically detects your Python version and installs the appropriate dependencies for optimal compatibility.
+
+### Development Installation
+
+For contributors and developers who need additional development tools:
+
+```sh
+git clone https://github.com/Dineshkarthik/telegram_media_downloader.git
+cd telegram_media_downloader
+make dev_install  # Installs both runtime and development dependencies
+```
+
+> **Note**: `make dev_install` also automatically detects your Python version and installs version-specific development dependencies.
 
 ## Configuration
 
-All the configurations are  passed to the Telegram Media Downloader via `config.yaml` file.
+All the configurations are passed to the Telegram Media Downloader via `config.yaml` file.
+
+### Setup Configuration
+
+1. Copy `config.yaml.example` to `config.yaml`:
+   ```sh
+   cp config.yaml.example config.yaml
+   ```
+2. Update the values in `config.yaml` with your specific details (API keys, chat ID, etc.).
+
+> **Note**: `config.yaml` is ignored by git to prevent accidental commits of sensitive information. Always use `config.yaml.example` as the template.
 
 **Getting your API Keys:**
 The very first step requires you to obtain a valid Telegram API key (API id/hash pair):
@@ -89,14 +133,20 @@ media_types:
 - photo
 - video
 - voice
+- video_note
 file_formats:
   audio:
   - all
   document:
-  - pdf
-  - epub
+  - all
   video:
-  - mp4
+  - all
+
+# Optional filters
+download_directory: null  # Custom directory path for downloads (absolute or relative path)
+start_date: null  # Filter messages after this date (ISO format, e.g., '2023-01-01' or '2023-01-01T00:00:00')
+end_date: null    # Filter messages before this date (ISO format)
+max_messages: null  # Limit the number of media items to download (integer)
 ```
 
 - api_hash  - The api_hash you got from telegram apps
@@ -106,14 +156,21 @@ file_formats:
 - ids_to_retry - `Leave it as it is.` This is used by the downloader script to keep track of all skipped downloads so that it can be downloaded during the next execution of the script.
 - media_types - Type of media to download, you can update which type of media you want to download it can be one or any of the available types.
 - file_formats - File types to download for supported media types which are `audio`, `document` and `video`. Default format is `all`, downloads all files.
+- download_directory - Optional: Custom directory path where media files will be downloaded. Can be absolute or relative path. If `null`, uses default directory structure. The directory will be created if it doesn't exist.
+- start_date - Optional: Filter messages to download only those sent after this date (ISO format, e.g., '2023-01-01'). Leave as `null` to disable.
+- end_date - Optional: Filter messages to download only those sent before this date (ISO format). Leave as `null` to disable.
+- max_messages - Optional: Limit the number of media items to download (integer). Leave as `null` for unlimited.
 
 ## Execution
 ```sh
-$ python3 media_downloader.py
+python3 media_downloader.py
 ```
-All the downloaded media will be stored inside  respective direcotry named  in the same path as the python script.
 
-| Media type | Download directory |
+### Download Directories
+
+By default, all downloaded media will be stored in respective directories named after the media type in the same path as the python script.
+
+| Media type | Default Download directory |
 |--|--|
 | audio | path/to/project/audio |
 | document | path/to/project/document |
@@ -121,6 +178,17 @@ All the downloaded media will be stored inside  respective direcotry named  in t
 | video | path/to/project/video |
 | voice | path/to/project/voice |
 | voice_note | path/to/project/voice_note |
+
+#### Custom Download Directory
+
+You can specify a custom download directory by setting the `download_directory` option in your `config.yaml`. This allows you to organize all downloads in a single custom location while maintaining the media type subdirectories.
+
+**Examples:**
+- `download_directory: "/home/user/downloads/telegram"` (absolute path)
+- `download_directory: "downloads/telegram"` (relative path)
+- `download_directory: null` (use default directory structure)
+
+If the specified directory doesn't exist, it will be automatically created. The media type subdirectories (audio/, photo/, etc.) will still be created within your custom directory.
 
 ## Proxy
 `socks4, socks5, http` proxies are supported in this project currently. To use it, add the following to the bottom of your `config.yaml` file

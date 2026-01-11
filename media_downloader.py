@@ -1,17 +1,27 @@
 """Downloads media from telegram."""
+
 import asyncio
 import logging
 import os
+from datetime import date, datetime, timezone
 from typing import List, Optional, Tuple, Union
 
-import pyrogram
 import yaml
-from pyrogram.types import Audio, Document, Photo, Video, VideoNote, Voice
 from rich.logging import RichHandler
+from telethon import TelegramClient
+from telethon.errors import FileReferenceExpiredError
+from telethon.tl.types import (
+    Document,
+    Message,
+    MessageMediaDocument,
+    MessageMediaPhoto,
+    Photo,
+)
+from tqdm import tqdm
 
 from utils.file_management import get_next_name, manage_duplicate_file
 from utils.log import LogFilter
-from utils.meta import print_meta
+from utils.meta import APP_VERSION, DEVICE_MODEL, LANG_CODE, SYSTEM_VERSION, print_meta
 from utils.updates import check_for_updates
 
 logging.basicConfig(
@@ -20,8 +30,8 @@ logging.basicConfig(
     datefmt="[%X]",
     handlers=[RichHandler()],
 )
-logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
-logging.getLogger("pyrogram.client").addFilter(LogFilter())
+logging.getLogger("telethon.client.downloads").addFilter(LogFilter())
+logging.getLogger("telethon.network").addFilter(LogFilter())
 logger = logging.getLogger("media_downloader")
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -90,54 +100,111 @@ def _is_exist(file_path: str) -> bool:
     return not os.path.isdir(file_path) and os.path.exists(file_path)
 
 
+def _progress_callback(current: int, total: int, pbar: tqdm) -> None:
+    """
+    Update progress bar for file downloads.
+
+    Parameters
+    ----------
+    current: int
+        Current number of bytes downloaded.
+    total: int
+        Total number of bytes to download.
+    pbar: tqdm
+        Progress bar instance to update.
+    """
+    if pbar.total != total:
+        pbar.total = total
+        pbar.reset()
+    pbar.update(current - pbar.n)
+
+
 async def _get_media_meta(
-    media_obj: Union[Audio, Document, Photo, Video, VideoNote, Voice],
+    media_obj: Union[Document, Photo],
     _type: str,
+    download_directory: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
     """Extract file name and file id from media object.
 
     Parameters
     ----------
-    media_obj: Union[Audio, Document, Photo, Video, VideoNote, Voice]
+    media_obj: Union[Document, Photo]
         Media object to be extracted.
     _type: str
         Type of media object.
+    download_directory: Optional[str]
+        Custom directory path for downloads. If None, uses default structure.
 
     Returns
     -------
     Tuple[str, Optional[str]]
         file_name, file_format
     """
-    if _type in ["audio", "document", "video"]:
-        # pylint: disable = C0301
-        file_format: Optional[str] = media_obj.mime_type.split("/")[-1]  # type: ignore
-    else:
-        file_format = None
+    file_format: Optional[str] = None
+    if hasattr(media_obj, "mime_type") and media_obj.mime_type:
+        file_format = media_obj.mime_type.split("/")[-1]
+    elif _type == "photo":
+        file_format = "jpg"
+
+    # Determine base directory for downloads
+    base_dir = download_directory if download_directory else THIS_DIR
 
     if _type in ["voice", "video_note"]:
-        # pylint: disable = C0209
-        file_format = media_obj.mime_type.split("/")[-1]  # type: ignore
         file_name: str = os.path.join(
-            THIS_DIR,
+            base_dir,
             _type,
-            "{}_{}.{}".format(
-                _type,
-                media_obj.date.isoformat(),  # type: ignore
-                file_format,
-            ),
+            f"{_type}_{media_obj.date.isoformat()}.{file_format}",
         )
     else:
-        file_name = os.path.join(
-            THIS_DIR, _type, getattr(media_obj, "file_name", None) or ""
-        )
+        file_name_base = ""
+        if hasattr(media_obj, "attributes"):
+            for attr in media_obj.attributes:
+                if hasattr(attr, "file_name"):
+                    file_name_base = attr.file_name
+                    break
+        if file_name_base == "":
+            if hasattr(media_obj, "id"):
+                file_name_base = f"{_type}_{media_obj.id}"
+        file_name = os.path.join(base_dir, _type, file_name_base)
     return file_name, file_format
 
 
-async def download_media(
-    client: pyrogram.client.Client,
-    message: pyrogram.types.Message,
+def get_media_type(message: Message) -> Optional[str]:
+    """
+    Determine the media type from the message's media attributes.
+
+    Parameters
+    ----------
+    message: Message
+        The Telethon message object.
+
+    Returns
+    -------
+    Optional[str]
+        The media type ('photo', 'video', 'audio', 'voice', 'video_note', 'document')
+        or None.
+    """
+    if not message.media:
+        return None
+    if isinstance(message.media, MessageMediaPhoto):
+        return "photo"
+    if isinstance(message.media, MessageMediaDocument):
+        doc = message.media.document
+        for attr in doc.attributes:
+            if hasattr(attr, "voice") and isinstance(attr.voice, bool):
+                return "voice" if attr.voice else "audio"
+            if hasattr(attr, "round_message") and isinstance(attr.round_message, bool):
+                return "video_note" if attr.round_message else "video"
+        return "document"
+    return None
+
+
+async def download_media(  # pylint: disable=too-many-locals
+    client: TelegramClient,
+    message: Message,
     media_types: List[str],
     file_formats: dict,
+    download_directory: Optional[str] = None,
 ):
     """
     Download media from Telegram.
@@ -147,23 +214,26 @@ async def download_media(
 
     Parameters
     ----------
-    client: pyrogram.client.Client
+    client: TelegramClient
         Client to interact with Telegram APIs.
-    message: pyrogram.types.Message
+    message: Message
         Message object retrieved from telegram.
     media_types: list
         List of strings of media types to be downloaded.
-        Ex : `["audio", "photo"]`
+        Ex : ["audio", "photo"]
         Supported formats:
             * audio
             * document
             * photo
             * video
+            * video_note
             * voice
     file_formats: dict
         Dictionary containing the list of file_formats
         to be downloaded for `audio`, `document` & `video`
         media types.
+    download_directory: Optional[str]
+        Custom directory path for downloads. If None, uses default structure.
 
     Returns
     -------
@@ -172,62 +242,88 @@ async def download_media(
     """
     for retry in range(3):
         try:
-            if message.media is None:
+            _type = get_media_type(message)
+            logger.debug("Processing message %s of type %s", message.id, _type)
+            if not _type or _type not in media_types:
                 return message.id
-            for _type in media_types:
-                _media = getattr(message, _type, None)
-                if _media is None:
-                    continue
-                file_name, file_format = await _get_media_meta(_media, _type)
-                if _can_download(_type, file_formats, file_format):
-                    if _is_exist(file_name):
-                        file_name = get_next_name(file_name)
+            media_obj = message.photo if _type == "photo" else message.document
+            if not media_obj:
+                return message.id
+            file_name, file_format = await _get_media_meta(
+                media_obj, _type, download_directory
+            )
+            if _can_download(_type, file_formats, file_format):
+                # Create progress bar for download
+                file_size = getattr(media_obj, "size", 0)
+                # Use original file name if available, otherwise generated name
+                display_name = getattr(
+                    media_obj, "file_name", os.path.basename(file_name)
+                )
+                desc = f"Downloading {display_name}"
+                logger.info(desc)
+
+                if _is_exist(file_name):
+                    file_name = get_next_name(file_name)
+                    with tqdm(
+                        total=file_size, unit="B", unit_scale=True, desc=desc
+                    ) as pbar:
+                        # pylint: disable=cell-var-from-loop
                         download_path = await client.download_media(
-                            message, file_name=file_name
+                            message,
+                            file=file_name,
+                            progress_callback=lambda c, t: _progress_callback(
+                                c, t, pbar
+                            ),
                         )
-                        # pylint: disable = C0301
-                        download_path = manage_duplicate_file(download_path)  # type: ignore
-                    else:
+                        download_path = manage_duplicate_file(
+                            download_path
+                        )  # type: ignore
+                else:
+                    with tqdm(
+                        total=file_size, unit="B", unit_scale=True, desc=desc
+                    ) as pbar:
+                        # pylint: disable=cell-var-from-loop
                         download_path = await client.download_media(
-                            message, file_name=file_name
+                            message,
+                            file=file_name,
+                            progress_callback=lambda c, t: _progress_callback(
+                                c, t, pbar
+                            ),
                         )
-                    if download_path:
-                        logger.info("Media downloaded - %s", download_path)
-                    DOWNLOADED_IDS.append(message.id)
+                if download_path:
+                    logger.info("Media downloaded - %s", download_path)
+                    logger.debug("Successfully downloaded message %s", message.id)
+                DOWNLOADED_IDS.append(message.id)
             break
-        except pyrogram.errors.exceptions.bad_request_400.BadRequest:
+        except FileReferenceExpiredError:
             logger.warning(
-                "Message[%d]: file reference expired, refetching...",
-                message.id,
+                "Message[%d]: file reference expired, refetching...", message.id
             )
-            message = await client.get_messages(  # type: ignore
-                chat_id=message.chat.id,  # type: ignore
-                message_ids=message.id,
-            )
+            messages = await client.get_messages(message.chat.id, ids=message.id)
+            message = messages[0] if messages else message
             if retry == 2:
-                # pylint: disable = C0301
                 logger.error(
-                    "Message[%d]: file reference expired for 3 retries, download skipped.",
+                    "Message[%d]: file reference expired, skipping download.",
                     message.id,
                 )
                 FAILED_IDS.append(message.id)
-        except TypeError:
-            # pylint: disable = C0301
+        except TimeoutError:
             logger.warning(
-                "Timeout Error occurred when downloading Message[%d], retrying after 5 seconds",
+                "Timeout Error occurred when downloading Message[%d], "
+                "retrying after 5 seconds",
                 message.id,
             )
             await asyncio.sleep(5)
             if retry == 2:
                 logger.error(
-                    "Message[%d]: Timing out after 3 reties, download skipped.",
+                    "Message[%d]: Timing out after 3 retries, download skipped.",
                     message.id,
                 )
                 FAILED_IDS.append(message.id)
         except Exception as e:
-            # pylint: disable = C0301
             logger.error(
-                "Message[%d]: could not be downloaded due to following exception:\n[%s].",
+                "Message[%d]: could not be downloaded due to following "
+                "exception:\n[%s].",
                 message.id,
                 e,
                 exc_info=True,
@@ -238,17 +334,18 @@ async def download_media(
 
 
 async def process_messages(
-    client: pyrogram.client.Client,
-    messages: List[pyrogram.types.Message],
+    client: TelegramClient,
+    messages: List[Message],
     media_types: List[str],
     file_formats: dict,
+    download_directory: Optional[str] = None,
 ) -> int:
     """
     Download media from Telegram.
 
     Parameters
     ----------
-    client: pyrogram.client.Client
+    client: TelegramClient
         Client to interact with Telegram APIs.
     messages: list
         List of telegram messages.
@@ -260,11 +357,14 @@ async def process_messages(
             * document
             * photo
             * video
+            * video_note
             * voice
     file_formats: dict
         Dictionary containing the list of file_formats
         to be downloaded for `audio`, `document` & `video`
         media types.
+    download_directory: Optional[str]
+        Custom directory path for downloads. If None, uses default structure.
 
     Returns
     -------
@@ -273,27 +373,31 @@ async def process_messages(
     """
     message_ids = await asyncio.gather(
         *[
-            download_media(client, message, media_types, file_formats)
+            download_media(
+                client, message, media_types, file_formats, download_directory
+            )
             for message in messages
         ]
     )
-
+    logger.info("Processed batch of %d messages", len(messages))
     last_message_id: int = max(message_ids)
     return last_message_id
 
 
-async def begin_import(config: dict, pagination_limit: int) -> dict:
+async def begin_import(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+    config: dict, pagination_limit: int
+) -> dict:
     """
-    Create pyrogram client and initiate download.
+    Create telethon client and initiate download.
 
-    The pyrogram client is created using the ``api_id``, ``api_hash``
+    The telethon client is created using the ``api_id``, ``api_hash``
     from the config and iter through message offset on the
     ``last_message_id`` and the requested file_formats.
 
     Parameters
     ----------
     config: dict
-        Dict containing the config to create pyrogram client.
+        Dict containing the config to create telethon client.
     pagination_limit: int
         Number of message to download asynchronously as a batch.
 
@@ -302,29 +406,91 @@ async def begin_import(config: dict, pagination_limit: int) -> dict:
     dict
         Updated configuration to be written into config file.
     """
-    client = pyrogram.Client(
+    proxy = config.get("proxy")
+    proxy_dict = None
+    if proxy:
+        proxy_dict = {
+            "proxy_type": proxy["scheme"],
+            "addr": proxy["hostname"],
+            "port": proxy["port"],
+            "username": proxy.get("username"),
+            "password": proxy.get("password"),
+        }
+    client = TelegramClient(
         "media_downloader",
         api_id=config["api_id"],
         api_hash=config["api_hash"],
-        proxy=config.get("proxy"),
+        proxy=proxy_dict,
+        device_model=DEVICE_MODEL,
+        system_version=SYSTEM_VERSION,
+        app_version=APP_VERSION,
+        lang_code=LANG_CODE,
     )
     await client.start()
     last_read_message_id: int = config["last_read_message_id"]
-    messages_iter = client.get_chat_history(
-        config["chat_id"], offset_id=last_read_message_id, reverse=True
+    start_date_val = config.get("start_date")
+    if isinstance(start_date_val, str) and start_date_val.strip():
+        start_date = datetime.fromisoformat(start_date_val)
+        if start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=timezone.utc)
+    elif isinstance(start_date_val, date):
+        start_date = datetime.combine(
+            start_date_val, datetime.min.time(), tzinfo=timezone.utc
+        )
+    else:
+        start_date = None
+    logger.info("Start date filter: %s", start_date or "None")
+    end_date_val = config.get("end_date")
+    if isinstance(end_date_val, str) and end_date_val.strip():
+        end_date = datetime.fromisoformat(end_date_val)
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+    elif isinstance(end_date_val, date):
+        end_date = datetime.combine(
+            end_date_val, datetime.min.time(), tzinfo=timezone.utc
+        )
+    else:
+        end_date = None
+    logger.info("End date filter: %s", end_date or "None")
+    max_messages_val = config.get("max_messages")
+    if isinstance(max_messages_val, int):
+        max_messages = max_messages_val
+    elif isinstance(max_messages_val, str) and max_messages_val.strip():
+        max_messages = int(max_messages_val)
+    else:
+        max_messages = None
+    logger.info("Max messages to download: %s", max_messages or "Unlimited")
+    download_directory_val = config.get("download_directory")
+    if isinstance(download_directory_val, str) and download_directory_val.strip():
+        download_directory = download_directory_val.strip()
+        # Convert to absolute path if relative
+        if not os.path.isabs(download_directory):
+            download_directory = os.path.abspath(download_directory)
+        # Create directory if it doesn't exist
+        os.makedirs(download_directory, exist_ok=True)
+        logger.info("Custom download directory: %s", download_directory)
+    else:
+        download_directory = None
+        logger.info("Download directory: Default")
+    messages_iter = client.iter_messages(
+        config["chat_id"], min_id=last_read_message_id + 1, reverse=True
     )
     messages_list: list = []
     pagination_count: int = 0
     if config["ids_to_retry"]:
         logger.info("Downloading files failed during last run...")
         skipped_messages: list = await client.get_messages(  # type: ignore
-            chat_id=config["chat_id"], message_ids=config["ids_to_retry"]
+            config["chat_id"], ids=config["ids_to_retry"]
         )
         for message in skipped_messages:
             pagination_count += 1
             messages_list.append(message)
 
     async for message in messages_iter:  # type: ignore
+        if end_date and message.date > end_date:
+            continue
+        if start_date and message.date < start_date:
+            break
         if pagination_count != pagination_limit:
             pagination_count += 1
             messages_list.append(message)
@@ -334,7 +500,10 @@ async def begin_import(config: dict, pagination_limit: int) -> dict:
                 messages_list,
                 config["media_types"],
                 config["file_formats"],
+                download_directory,
             )
+            if max_messages and len(DOWNLOADED_IDS) >= max_messages:
+                break
             pagination_count = 0
             messages_list = []
             messages_list.append(message)
@@ -346,9 +515,10 @@ async def begin_import(config: dict, pagination_limit: int) -> dict:
             messages_list,
             config["media_types"],
             config["file_formats"],
+            download_directory,
         )
 
-    await client.stop()
+    await client.disconnect()
     config["last_read_message_id"] = last_read_message_id
     return config
 
